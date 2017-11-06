@@ -1,0 +1,290 @@
+#!/usr/bin/env python
+# Contributors Listed Below - COPYRIGHT 2017
+# [+] International Business Machines Corp.
+#
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+# implied. See the License for the specific language governing
+# permissions and limitations under the License.
+
+"""
+mkobj is a D-Bus application that enables creation of arbitrary
+D-Bus interfaces on arbitrary paths.  The intended use case is
+for mocking of objects with special consideration for testing
+of the OpenBMC Object Mapper API and its implementations.
+
+A typical usage pattern might be:
+
+1 - Start the bus server application:
+    mkobj server &
+
+2 - Create an interface (xyz.openbmc_project.Testing
+        on /xyz/openbmc_project/test):
+    mkobj create /xyz/openbmc_project/test \
+        --property xyz.openbmc_project.Testing SomeProperty1 hello \
+        --property xyz.openbmc_project.Testing SomeProperty2 123 \
+
+3 - Manipulate properties on the newly created interface in the usual way:
+    busctl set-property xyz.openbmc_project.mkobj1 \
+        /xyz/openbmc_project/test \
+        xyz.openbmc_project.Testing \
+        SomeProperty1 s world
+
+4 - Create an association object:
+    mkobj assoc /xyz/openbmc_project/assoc \
+       -a fwd rev /xyz/openbmc_project/test
+
+5 - Add an endpoint that doesn't exist yet to the newly created
+        association:
+    mkobj endpoint /xyz/openbmc_project/assoc \
+        -a fwd rev /xyz/openbmc_project/idontexist
+
+6 - Remove test objects:
+    mkobj remove /xyz/openbmc_project/assoc
+    mkobj remove /xyz/openbmc_project/test
+"""
+
+import argparse
+import dbus
+import dbus.service
+import dbus.mainloop.glib
+import gobject
+import obmc.dbuslib.bindings
+import sys
+
+DBUS_NAME = 'xyz.openbmc_project.mkobj1'
+CREATE_NAME = 'xyz.openbmc_project.mkobj1.Create'
+REMOVE_NAME = 'xyz.openbmc_project.mkobj1.Delete'
+ASSOCIATIONS_IFACE = 'org.openbmc.Associations'
+
+PATH = '/xyz/openbmc_project/mkobj1/create'
+MANAGER_PATH = '/xyz/openbmc_project'
+
+
+class Object(obmc.dbuslib.bindings.DbusProperties):
+    def __init__(self, manager, *a, **kw):
+        super(Object, self).__init__(*a, **kw)
+        self.path = kw.get('object_path')
+        self.manager = manager
+        self.unmask_signals()
+
+    @dbus.service.method(REMOVE_NAME, '', '')
+    def Delete(self):
+        self.manager.remove(self.path)
+
+
+def get_object_class(ifaces):
+    name = '+'.join(['ObjectType'] + ifaces)
+    cls = type(name, (Object,), {})
+    obmc.dbuslib.bindings.add_interfaces_to_class(cls, ifaces)
+
+    return cls
+
+
+class ObjectFactory(dbus.service.Object):
+    def __init__(self, *a, **kw):
+        manager_path = kw.pop('manager_path')
+        self.dbus_bus = kw.get('conn')
+        super(ObjectFactory, self).__init__(*a, **kw)
+
+        kw['object_path'] = manager_path
+        self.manager = obmc.dbuslib.bindings.DbusObjectManager(*a, **kw)
+        self.manager.unmask_signals()
+
+    @dbus.service.method(CREATE_NAME, 'sa{sa{sv}}', '')
+    def Create(self, path, properties):
+        ifaces = [str(x) for x in properties]
+        Obj = get_object_class(ifaces)
+        o = Obj(self.manager, conn=self.dbus_bus, object_path=path)
+        o.properties = properties
+        self.manager.add(path, o)
+
+
+def server(bus_connection, args):
+    factory = ObjectFactory(
+        manager_path=MANAGER_PATH,
+        conn=bus_connection,
+        object_path=PATH)
+    name = dbus.service.BusName(
+        DBUS_NAME, bus_connection)
+    loop = gobject.MainLoop()
+
+    def started():
+        print('{} ready...'.format(DBUS_NAME))
+
+    gobject.idle_add(started)
+    loop.run()
+
+
+def get_bus_connection():
+    return dbus.SystemBus()
+
+
+def get_method_host_obj():
+    conn = get_bus_connection()
+    return conn.get_object(
+        DBUS_NAME,
+        PATH,
+        introspect=False)
+
+
+def add_properties(args, properties):
+    for iface, prop, value in args.properties:
+        properties.setdefault(iface, {}).setdefault(prop, value)
+
+    return properties
+
+
+def create(obj, args, **kw):
+    properties = kw.get('properties', {})
+    properties = add_properties(args, properties)
+    iface = dbus.Interface(obj, CREATE_NAME)
+    iface.Create(
+        args.path, dbus.Dictionary(properties, signature='sa{sv}'))
+
+    if kw.get('properties') is None:
+        print(
+            'created {} with {} properties'.format(
+                args.path, len(properties)))
+
+
+def remove(dbus_connection, args):
+    obj = dbus_connection.get_object(
+        DBUS_NAME,
+        args.path,
+        introspect=False)
+    iface = dbus.Interface(obj, REMOVE_NAME)
+    iface.Delete()
+    print('removed {}'.format(args.path))
+
+
+def assoc(obj, args):
+    properties = {}
+    properties.setdefault(
+        ASSOCIATIONS_IFACE, {}).setdefault(
+            'associations', dbus.Array([], signature='(sss)'))
+
+    for assoc in args.associations:
+        properties[ASSOCIATIONS_IFACE]['associations'].append(assoc)
+
+    create(obj, args, properties=properties)
+    print(
+        'created {} with {} association(s) and {} '
+        'additional properties'.format(
+            args.path, len(args.associations), len(args.properties)))
+
+
+def endpoint(dbus_connection, args):
+    obj = dbus_connection.get_object(
+        DBUS_NAME,
+        args.path,
+        introspect=False)
+    iface = dbus.Interface(obj, 'org.freedesktop.DBus.Properties')
+
+    associations = iface.Get(
+        ASSOCIATIONS_IFACE, 'associations')
+
+    for assoc in args.append:
+        associations.append(assoc)
+    for assoc in args.remove:
+        try:
+            associations.remove(dbus.Struct(assoc, signature='sss'))
+        except ValueError as e:
+            sys.stderr.write('warning: association {} was not found\n'.format(
+                ','.join(assoc)))
+            continue
+
+    iface.Set(
+        ASSOCIATIONS_IFACE, 'associations', associations)
+    print(
+        'removed {} and created {} endpoint(s) on {}'.format(
+            len(args.remove), len(args.append), args.path))
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='D-Bus object testing tool')
+    subparsers = parser.add_subparsers(title='subcommands')
+    server_parser = subparsers.add_parser(
+        'server',
+        help='start a D-Bus service to host test objects',
+        description='start a D-Bus service to host test objects')
+    server_parser.set_defaults(setup=get_bus_connection)
+    server_parser.set_defaults(func=server)
+
+    create_parser = subparsers.add_parser(
+        'create',
+        help='create a new D-Bus object',
+        description='create a new D-Bus object')
+    create_parser.set_defaults(setup=get_method_host_obj)
+    create_parser.set_defaults(func=create)
+    create_parser.add_argument(
+        'path', metavar='PATH',
+        help='The path of the object to be created')
+    create_parser.add_argument(
+        '-p', '--property', dest='properties',
+        default=[], nargs=3, action='append',
+        help=(
+            'A value to be assigned to a property (use -p multiple '
+            'times)'),
+        metavar=('INTERFACE', 'PROPERTY', 'VALUE'))
+
+    remove_parser = subparsers.add_parser(
+        'remove',
+        formatter_class=argparse.RawTextHelpFormatter,
+        help='remove a previously created D-Bus object')
+    remove_parser.set_defaults(setup=get_bus_connection)
+    remove_parser.set_defaults(func=remove)
+    remove_parser.add_argument(
+        'path', metavar='PATH',
+        help='The path of the object to be removed')
+
+    assoc_parser = subparsers.add_parser(
+        'assoc',
+        formatter_class=argparse.RawTextHelpFormatter,
+        help='create a D-Bus object implementing the Associations interface')
+    assoc_parser.set_defaults(setup=get_method_host_obj)
+    assoc_parser.set_defaults(func=assoc)
+    assoc_parser.add_argument('path', metavar='PATH')
+    assoc_parser.add_argument(
+        '-p', '--property', dest='properties',
+        default=[], nargs=3, action='append',
+        metavar=('INTERFACE', 'PROPERTY', 'VALUE'))
+    assoc_parser.add_argument(
+        '-a', '--assoc', dest='associations',
+        nargs=3, default=[], action='append',
+        metavar=('FWD', 'REV', 'TARGET'))
+
+    endpoint_parser = subparsers.add_parser(
+        'endpoint',
+        formatter_class=argparse.RawTextHelpFormatter,
+        help='manipulate endpoints on an existing \
+            object implementing the Associations interface')
+    endpoint_parser.set_defaults(setup=get_bus_connection)
+    endpoint_parser.set_defaults(func=endpoint)
+    endpoint_parser.add_argument('path', metavar='PATH')
+    endpoint_parser.add_argument(
+        '-a', '--append', dest='append',
+        nargs=3, default=[], action='append',
+        metavar=('FWD', 'REV', 'TARGET'))
+    endpoint_parser.add_argument(
+        '-r', '--remove', dest='remove',
+        nargs=3, default=[], action='append',
+        metavar=('FWD', 'REV', 'TARGET'))
+
+    dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
+    args = parser.parse_args()
+    data = args.setup()
+    args.func(data, args)
+
+
+if __name__ == "__main__":
+    sys.exit(0 if main() else 1)
